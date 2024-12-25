@@ -1,7 +1,3 @@
-Below is a sample **README.md** layout you could use on GitHub for your application. It’s organized to be clear and concise, with headings, bulleted lists, and code blocks for easy reference.
-
----
-
 # Narrator Chat TTS
 
 This application assigns each user in a Twitch chat a Windows 11 **Natural Voice** (installed on your system) based on an index derived from their username. It then reads their messages aloud in that voice.
