@@ -1,4 +1,5 @@
 import sys
+import io
 import socket
 import threading
 import hashlib
@@ -9,6 +10,9 @@ import pystray
 from pystray import MenuItem as item
 from PIL import Image
 import os
+
+# Set stdout to use UTF-8 encoding to handle special characters
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # =======================
 # Configuration
@@ -21,6 +25,7 @@ TWITCH_USERNAME = "your_bot_username"       # e.g. "myBot"
 TWITCH_CHANNEL  = "#your_channel_name"      # Must include '#'
 
 VOICE_INDEX_SHIFT = 10  # Shift the voice index by this amount to change the voice assignment
+
 
 # Ensure the file path is correct
 icon_path = os.path.join(os.path.dirname(__file__), "Asset 3@4x.ico")
@@ -61,6 +66,33 @@ def tray_icon_thread(shutdown_event):
     icon = create_tray_icon(shutdown_event)
     icon.run()
 
+def test_all_voices():
+    """
+    Iterates over all available voices and tests them by speaking a predefined message.
+    This helps identify any problematic voices before the bot starts.
+    """
+    pythoncom.CoInitialize()
+    try:
+        voice_probe = wincl.Dispatch("SAPI.SpVoice")
+        all_voices = voice_probe.GetVoices()
+        test_message = "Testing voice functionality."
+
+        print("Starting voice test...")
+        for i, voice in enumerate(all_voices):
+            try:
+                try:
+                    description = voice.GetDescription()
+                except Exception as e:
+                    description = f"Unknown (Error: {e})"
+                voice_probe.Voice = voice
+                print(f"Testing voice {i + 1}/{len(all_voices)}: {description}")
+                voice_probe.Speak(test_message)
+            except Exception as e:
+                print(f"[Error] Voice {i + 1} ({description}) failed: {e}")
+        print("Voice test completed.")
+    finally:
+        pythoncom.CoUninitialize()
+
 def main_bot_loop(shutdown_event):
     """
     The main Twitch bot logic goes here. 
@@ -69,17 +101,15 @@ def main_bot_loop(shutdown_event):
     """
     pythoncom.CoInitialize()
 
-    # Create SAPI voice object
-    voice = wincl.Dispatch("SAPI.SpVoice")
-
-    # Filter for "(Natural)" voices
-    all_voices = voice.GetVoices()
+    # Temp voice object to get available voices
+    voice_probe = wincl.Dispatch("SAPI.SpVoice")
+    all_voices = voice_probe.GetVoices()
     natural_voices = [v for v in all_voices if "(Natural)" in v.GetDescription()]
     if not natural_voices:
-        print("[Error] No '(Natural)' voices found.")
-        pythoncom.CoUninitialize()
-        return
+        print("[Error] No '(Natural)' voices found. Using default voices.")
+        natural_voices = all_voices  # Fallback to all available voices
 
+    # This dict maps raw_user -> (voice_token, voice_instance)
     user_voice_map = {}
 
     # Attempt to connect to Twitch
@@ -106,12 +136,10 @@ def main_bot_loop(shutdown_event):
 
     try:
         while not shutdown_event.is_set():
-            # Non-blocking read with a small timeout or check
             s.settimeout(0.5)
             try:
                 raw_data = s.recv(2048)
             except socket.timeout:
-                # No data received in this interval, check event again
                 continue
 
             if not raw_data:
@@ -131,41 +159,57 @@ def main_bot_loop(shutdown_event):
                     continue
 
                 if "PRIVMSG" in line:
-                    # e.g. :username!username@username.tmi.twitch.tv PRIVMSG #channel :Hello
                     user_and_host, _, msg_content = line.partition("PRIVMSG")
                     raw_user = user_and_host.lstrip(":").split("!")[0]
                     parts = msg_content.split(" :")
                     chat_text = parts[1] if len(parts) > 1 else ""
 
-                    # Assign a voice for this user if not already
-                    if raw_user not in user_voice_map:
-                        idx = (stable_hash(raw_user) + VOICE_INDEX_SHIFT) % len(natural_voices)
-                        user_voice_map[raw_user] = natural_voices[idx]
+                    # Skip messages from the bot/streamer account
+                    if raw_user.lower() == TWITCH_USERNAME.lower():
+                        continue
 
-                    voice.Voice = user_voice_map[raw_user]
-                    print(f"Speaking as {raw_user} with voice {voice.Voice.GetDescription()}: {chat_text}")
-                    voice.Speak(chat_text)
+                    # Assign a voice and voice instance for this user if not already
+                    if raw_user not in user_voice_map:
+                        if len(natural_voices) > 0:
+                            idx = (stable_hash(raw_user) + VOICE_INDEX_SHIFT) % len(natural_voices)
+                            voice_token = natural_voices[idx]
+                            user_voice_instance = wincl.Dispatch("SAPI.SpVoice")
+                            user_voice_instance.Voice = voice_token
+                            user_voice_map[raw_user] = (voice_token, user_voice_instance)
+                        else:
+                            print("[Error] No voices available to assign.")
+                            continue  # Skip processing this user
+
+                    voice_token, user_voice_instance = user_voice_map[raw_user]
+                    print(f"Speaking as {raw_user} with voice {voice_token.GetDescription()}: {chat_text}")
+                    
+                    try:
+                        user_voice_instance.Speak(chat_text)
+                    except Exception as e:
+                        print(f"[Error] Failed to speak message for {raw_user}: {e}")
 
     except KeyboardInterrupt:
         print("\n[Info] Bot interrupted via keyboard.")
     finally:
-        # Clean up
         s.close()
         pythoncom.CoUninitialize()
         print("Bot has shut down.")
 
 def main():
-    # 1) Create an Event to signal shutdown
+    # 1) Test all voices at startup
+    # test_all_voices()
+
+    # 2) Create an Event to signal shutdown
     shutdown_event = threading.Event()
 
-    # 2) Launch tray icon in a separate thread
+    # 3) Launch tray icon in a separate thread
     tray_thread = threading.Thread(target=tray_icon_thread, args=(shutdown_event,), daemon=True)
     tray_thread.start()
 
-    # 3) Run the main bot loop
+    # 4) Run the main bot loop
     main_bot_loop(shutdown_event)
 
-    # 4) Once the bot loop ends, if the tray is still running, we can stop it
+    # 5) Once the bot loop ends, if the tray is still running, we can stop it
     shutdown_event.set()  # signal tray to close
     print("Main function exit.")
 
