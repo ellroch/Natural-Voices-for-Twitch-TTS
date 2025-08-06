@@ -1,4 +1,6 @@
-### bot_logic.py
+# bot_logic.py
+import os
+import json
 import threading
 import time
 import traceback
@@ -7,25 +9,149 @@ import socket
 import hashlib
 import win32com.client as wincl
 import re
-from .config import log_service_message, load_config
+from datetime import datetime
+from .config import log_service_message, load_config, CONFIG_FOLDER
 
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6667
 
+ASSIGNED_PATH = os.path.join(CONFIG_FOLDER, "AssignedVoices.json")
+_ASSIGNED_LOCK = threading.Lock()
+
 
 def apply_substitutions(text: str) -> str:
-    cfg = load_config()
-    for rule in cfg.get("substitutions", []):
+    for rule in load_config().get("substitutions", []):
         try:
             text = re.sub(rule["pattern"], rule["replacement"], text, flags=re.IGNORECASE)
         except re.error as e:
-            log_service_message(f"Regex error in substitution rule: {e}")
+            log_service_message(f"Regex error: {e}")
     return text
 
 
 def stable_hash(username: str) -> int:
-    md5_hex = hashlib.md5(username.encode("utf-8")).hexdigest()
-    return int(md5_hex, 16)
+    return int(hashlib.md5(username.encode("utf-8")).hexdigest(), 16)
+
+
+def load_assigned_voices() -> dict[str, int]:
+    """
+    Load or initialize AssignedVoices.json in CONFIG_FOLDER.
+    If missing, create with examples. On corruption, back up and regenerate.
+    Returns a dict mapping usernames to voice indices.
+    """
+    default = {"chatter1": 0, "chatter2": 1}
+    with _ASSIGNED_LOCK:
+        os.makedirs(CONFIG_FOLDER, exist_ok=True)
+        if not os.path.isfile(ASSIGNED_PATH):
+            try:
+                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
+                    json.dump(default, f, indent=2)
+                log_service_message("Created default AssignedVoices.json")
+            except Exception as e:
+                log_service_message(f"Failed to create AssignedVoices.json: {e}")
+            return default.copy()
+        try:
+            with open(ASSIGNED_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            corrupted = ASSIGNED_PATH + f".corrupted_{ts}"
+            try:
+                os.rename(ASSIGNED_PATH, corrupted)
+                log_service_message(f"Backed up corrupted AssignedVoices.json to {corrupted}")
+            except Exception as e:
+                log_service_message(f"Failed to back up corrupted AssignedVoices.json: {e}")
+            try:
+                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
+                    json.dump(default, f, indent=2)
+                log_service_message("Recreated default AssignedVoices.json after corruption")
+            except Exception as e:
+                log_service_message(f"Failed to recreate AssignedVoices.json: {e}")
+            return default.copy()
+        except Exception as e:
+            log_service_message(f"Error loading AssignedVoices.json: {e}")
+            return default.copy()
+
+
+def get_voice_lists():
+    """
+    Returns two lists of SAPI tokens:
+      - preferred: voices whose description contains "(Natural)" and "Online"
+      - fallback: all remaining voices
+    """
+    pythoncom.CoInitialize()
+    try:
+        probe = wincl.Dispatch("SAPI.SpVoice")
+        tokens = probe.GetVoices()
+        preferred, fallback = [], []
+        for i in range(tokens.Count):
+            tok = tokens.Item(i)
+            desc = tok.GetDescription()
+            if "(Natural)" in desc and "Online" in desc:
+                preferred.append(tok)
+            else:
+                fallback.append(tok)
+        return preferred, fallback
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def test_voice_indices():
+    """
+    Announce totals and then speak each 'preferred' voice by index.
+    """
+    preferred, fallback = get_voice_lists()
+    pool = preferred if preferred else fallback
+    pref_count = len(preferred)
+    fall_count = len(fallback)
+    total = pref_count + fall_count
+
+    pythoncom.CoInitialize()
+    try:
+        probe = wincl.Dispatch("SAPI.SpVoice")
+        probe.Speak(f"Voice check: {total} total; {pref_count} preferred; {fall_count} others")
+        time.sleep(0.5)
+        for idx, voice in enumerate(pool):
+            desc = voice.GetDescription()
+            try:
+                probe.Voice = voice
+                probe.Speak(f"Voice {idx}: {desc}")
+                log_service_message(f"Spoke index {idx}: '{desc}'")
+            except Exception as e:
+                log_service_message(f"Failed voice {idx} '{desc}': {e}")
+            time.sleep(0.3)
+        log_service_message(
+            f"Completed voice index test using {'preferred' if preferred else 'fallback'} pool (size {len(pool)})"
+        )
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def speak_voice_index(index: int, extra_text: str = ""):
+    """
+    Speak 'Voice {index}' from preferred pool (or fallback),
+    appending any extra_text provided.
+    """
+    preferred, fallback = get_voice_lists()
+    pool = preferred if preferred else fallback
+    count = len(pool)
+    if index < 0 or index >= count:
+        log_service_message(f"Invalid voice index: {index}")
+        return
+
+    pythoncom.CoInitialize()
+    try:
+        probe = wincl.Dispatch("SAPI.SpVoice")
+        voice = pool[index]
+        desc = voice.GetDescription()
+        probe.Voice = voice
+        message = f"Voice {index}: {desc}"
+        if extra_text:
+            message += f". {extra_text}"
+        probe.Speak(message)
+        log_service_message(f"Spoken voice index {index}: '{message}'")
+    finally:
+        pythoncom.CoUninitialize()
+
 
 class TwitchBot:
     def __init__(self, shutdown_event: threading.Event):
@@ -34,48 +160,35 @@ class TwitchBot:
         self.tts_enabled = self.config.get("tts_enabled", True)
         self.socket: socket.socket | None = None
         self.connected = False
-        self.natural_voices: list = []
+        # load manual assignments (read-only afterwards)
+        self.assigned_voices = load_assigned_voices()
+        # load preferred list for chat assignments
+        self.preferred_voices, _ = get_voice_lists()
         self.voice_index_shift = self.config.get("voice_index", 0)
-        self.user_voice_map: dict[str, any] = {}
+        self.user_voice_map: dict[str, wincl.CDispatch] = {}
         self.listen_thread: threading.Thread | None = None
 
     def start(self):
         log_service_message("TwitchBot starting")
-        try:
-            log_service_message("Calling pythoncom.CoInitialize")
-            pythoncom.CoInitialize()
-        except Exception as e:
-            log_service_message(f"CoInitialize error: {e}")
+        pythoncom.CoInitialize()
         self.config = load_config()
         self.tts_enabled = self.config.get("tts_enabled", True)
-        self._setup_tts()
         self._connect_to_twitch()
         if self.connected:
             self._start_listening()
-
-    def _setup_tts(self):
-        try:
-            probe = wincl.Dispatch("SAPI.SpVoice")
-            voices = probe.GetVoices()
-            naturals = [v for v in voices if "(Natural)" in v.GetDescription()]
-            self.natural_voices = naturals or list(voices)
-            log_service_message(f"Loaded {len(self.natural_voices)} voices")
-        except Exception as e:
-            log_service_message(f"TTS setup failed: {e}")
-            self.natural_voices = []
 
     def _connect_to_twitch(self):
         try:
             self.socket = socket.socket()
             self.socket.connect((TWITCH_HOST, TWITCH_PORT))
-            self.socket.sendall(f"PASS {self.config['irc']['oauth']}\r\n".encode())
-            self.socket.sendall(f"NICK {self.config['irc']['username']}\r\n".encode())
-            self.socket.sendall(f"JOIN {self.config['irc']['channel']}\r\n".encode())
+            irc = self.config["irc"]
+            self.socket.sendall(f"PASS {irc['oauth']}\r\n".encode())
+            self.socket.sendall(f"NICK {irc['username']}\r\n".encode())
+            self.socket.sendall(f"JOIN {irc['channel']}\r\n".encode())
             self.connected = True
-            log_service_message(f"Connected to {self.config['irc']['channel']}")
+            log_service_message(f"Connected to {irc['channel']}")
         except Exception as e:
             log_service_message(f"Connection/Auth failed: {e}")
-            self.connected = False
 
     def _start_listening(self):
         self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
@@ -89,78 +202,55 @@ class TwitchBot:
             except Exception as e:
                 log_service_message(f"Socket recv error: {e}")
                 break
+
             buffer += data
             lines = buffer.split("\r\n")
             buffer = lines.pop()
             for line in lines:
-                try:
-                    if line.startswith("PING"):
-                        self.socket.sendall("PONG :tmi.twitch.tv\r\n".encode())
+                if line.startswith("PING"):
+                    self.socket.sendall("PONG :tmi.twitch.tv\r\n".encode())
+                    continue
+                if "PRIVMSG" in line:
+                    user_host, _, msg = line.partition("PRIVMSG")
+                    username = user_host.lstrip(":").split("!")[0]
+                    chat = msg.split(" :", 1)[1] if " :" in msg else ""
+                    chat = apply_substitutions(chat)
+
+                    # skip self
+                    if username.lower() == self.config["irc"]["username"].lower():
                         continue
-                    if "PRIVMSG" in line:
-                        prefix, _, msg = line.partition("PRIVMSG")
-                        raw_user = prefix.lstrip(":").split("!")[0]
-                        chat_text = msg.split(" :", 1)[1] if " :" in msg else ""
-                        chat_text = apply_substitutions(chat_text)
-                        if raw_user.lower() == self.config["irc"]["username"].lower():
-                            continue
-                        if raw_user not in self.user_voice_map and self.natural_voices:
-                            idx = (stable_hash(raw_user) + self.voice_index_shift) % len(self.natural_voices)
-                            voice = self.natural_voices[idx]
+
+                    # choose voice: manual assignment first
+                    if username in self.assigned_voices:
+                        idx = self.assigned_voices[username]
+                    else:
+                        idx = (stable_hash(username) + self.voice_index_shift) % len(self.preferred_voices)
+
+                    voice = self.preferred_voices[idx]
+                    log_service_message(f"TTS assign @{username} -> idx={idx}")
+
+                    # create or reuse voice instance
+                    try:
+                        if username not in self.user_voice_map:
                             inst = wincl.Dispatch("SAPI.SpVoice")
                             inst.Voice = voice
-                            self.user_voice_map[raw_user] = inst
-                        if load_config().get("tts_enabled", True):
-                            self.user_voice_map[raw_user].Speak(chat_text)
-                except Exception:
-                    log_service_message("Error in message handling: " + traceback.format_exc())
-        self._cleanup()
+                            self.user_voice_map[username] = inst
+                        speaker = self.user_voice_map[username]
+                    except Exception as e:
+                        log_service_message(f"Error instantiating voice for @{username}: {e}")
+                        continue
 
-    def reconnect(self):
-        log_service_message("Reconnecting TwitchBot...")
-        self.shutdown_event.set()
-        if self.listen_thread:
-            self.listen_thread.join(timeout=5)
-        time.sleep(2)
-        self.shutdown_event.clear()
-        self.user_voice_map.clear()
-        self.start()
+                    if self.tts_enabled:
+                        try:
+                            speaker.Speak(chat)
+                        except Exception as e:
+                            log_service_message(f"TTS speak error @{username}: {e}")
 
-    def _cleanup(self):
+        # cleanup
         if self.socket:
             try:
                 self.socket.close()
-            except Exception as e:
-                log_service_message(f"Socket close error: {e}")
-        try:
-            log_service_message("Calling pythoncom.CoUninitialize")
-            pythoncom.CoUninitialize()
-        except Exception as e:
-            log_service_message(f"CoUninitialize error: {e}")
+            except:
+                pass
+        pythoncom.CoUninitialize()
         log_service_message("Bot loop exiting")
-
-
-def test_all_voices():
-    try:
-        pythoncom.CoInitialize()
-        probe = wincl.Dispatch("SAPI.SpVoice")
-        voices = probe.GetVoices()
-        for idx, v in enumerate(voices, 1):
-            desc = v.GetDescription()
-            probe.Voice = v
-            probe.Speak("Testing voice functionality.")
-            print(f"Tested voice {idx}: {desc}")
-    except Exception as e:
-        log_service_message(f"Voice test failed: {e}")
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
-
-
-def main_bot_loop(shutdown_event: threading.Event):
-    bot = TwitchBot(shutdown_event)
-    bot.start()
-    shutdown_event.wait()
-    bot._cleanup()

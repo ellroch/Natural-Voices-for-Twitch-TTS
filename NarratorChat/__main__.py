@@ -1,3 +1,4 @@
+## __main__.py for NarratorChat
 import sys
 from .tray_app import run_tray
 from .config import log_service_message
