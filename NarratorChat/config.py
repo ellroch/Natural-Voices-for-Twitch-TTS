@@ -6,9 +6,11 @@ from datetime import datetime
 import threading
 
 _config_lock = threading.Lock()
+_ASSIGNED_LOCK = threading.Lock()
 APPDATA = os.getenv("APPDATA") or os.path.expanduser("~")
 CONFIG_FOLDER = os.path.join(APPDATA, "NarratorChat")
 CONFIG_PATH = os.path.join(CONFIG_FOLDER, "config.json")
+ASSIGNED_PATH = os.path.join(CONFIG_FOLDER, "AssignedVoices.json")
 LOG_FILE = os.path.join(CONFIG_FOLDER, "service.log")
 
 DEFAULT_CONFIG = {
@@ -31,7 +33,44 @@ DEFAULT_CONFIG = {
     ],
 }
 
-
+def load_assigned_voices() -> dict[str, int]:
+    """
+    Load or initialize AssignedVoices.json in CONFIG_FOLDER.
+    If missing, create with examples. On corruption, back up and regenerate.
+    Returns a dict mapping usernames to voice indices.
+    """
+    default = {"chatter1": 0, "chatter2": 1}
+    with _ASSIGNED_LOCK:
+        os.makedirs(CONFIG_FOLDER, exist_ok=True)
+        if not os.path.isfile(ASSIGNED_PATH):
+            try:
+                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
+                    json.dump(default, f, indent=2)
+                log_service_message("Created default AssignedVoices.json")
+            except Exception as e:
+                log_service_message(f"Failed to create AssignedVoices.json: {e}")
+            return default.copy()
+        try:
+            with open(ASSIGNED_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            corrupted = ASSIGNED_PATH + f".corrupted_{ts}"
+            try:
+                os.rename(ASSIGNED_PATH, corrupted)
+                log_service_message(f"Backed up corrupted AssignedVoices.json to {corrupted}")
+            except Exception as e:
+                log_service_message(f"Failed to back up corrupted AssignedVoices.json: {e}")
+            try:
+                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
+                    json.dump(default, f, indent=2)
+                log_service_message("Recreated default AssignedVoices.json after corruption")
+            except Exception as e:
+                log_service_message(f"Failed to recreate AssignedVoices.json: {e}")
+            return default.copy()
+        except Exception as e:
+            log_service_message(f"Error loading AssignedVoices.json: {e}")
+            return default.copy()
 
 def save_config(data: dict) -> None:
     with _config_lock:

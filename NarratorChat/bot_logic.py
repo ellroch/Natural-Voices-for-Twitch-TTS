@@ -10,14 +10,10 @@ import hashlib
 import win32com.client as wincl
 import re
 from datetime import datetime
-from .config import log_service_message, load_config, CONFIG_FOLDER
+from .config import log_service_message, load_config, load_assigned_voices
 
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6667
-
-ASSIGNED_PATH = os.path.join(CONFIG_FOLDER, "AssignedVoices.json")
-_ASSIGNED_LOCK = threading.Lock()
-
 
 def apply_substitutions(text: str) -> str:
     for rule in load_config().get("substitutions", []):
@@ -30,46 +26,6 @@ def apply_substitutions(text: str) -> str:
 
 def stable_hash(username: str) -> int:
     return int(hashlib.md5(username.encode("utf-8")).hexdigest(), 16)
-
-
-def load_assigned_voices() -> dict[str, int]:
-    """
-    Load or initialize AssignedVoices.json in CONFIG_FOLDER.
-    If missing, create with examples. On corruption, back up and regenerate.
-    Returns a dict mapping usernames to voice indices.
-    """
-    default = {"chatter1": 0, "chatter2": 1}
-    with _ASSIGNED_LOCK:
-        os.makedirs(CONFIG_FOLDER, exist_ok=True)
-        if not os.path.isfile(ASSIGNED_PATH):
-            try:
-                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
-                    json.dump(default, f, indent=2)
-                log_service_message("Created default AssignedVoices.json")
-            except Exception as e:
-                log_service_message(f"Failed to create AssignedVoices.json: {e}")
-            return default.copy()
-        try:
-            with open(ASSIGNED_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            corrupted = ASSIGNED_PATH + f".corrupted_{ts}"
-            try:
-                os.rename(ASSIGNED_PATH, corrupted)
-                log_service_message(f"Backed up corrupted AssignedVoices.json to {corrupted}")
-            except Exception as e:
-                log_service_message(f"Failed to back up corrupted AssignedVoices.json: {e}")
-            try:
-                with open(ASSIGNED_PATH, "w", encoding="utf-8") as f:
-                    json.dump(default, f, indent=2)
-                log_service_message("Recreated default AssignedVoices.json after corruption")
-            except Exception as e:
-                log_service_message(f"Failed to recreate AssignedVoices.json: {e}")
-            return default.copy()
-        except Exception as e:
-            log_service_message(f"Error loading AssignedVoices.json: {e}")
-            return default.copy()
 
 
 def get_voice_lists():
@@ -223,6 +179,9 @@ class TwitchBot:
                     # choose voice: manual assignment first
                     if username in self.assigned_voices:
                         idx = self.assigned_voices[username]
+                        if idx < 0:
+                            log_service_message(f"Skipping negative index for @{username}(filterd)")
+                            continue
                     else:
                         idx = (stable_hash(username) + self.voice_index_shift) % len(self.preferred_voices)
 
