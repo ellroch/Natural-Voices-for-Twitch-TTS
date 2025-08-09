@@ -47,7 +47,8 @@ def stop_bot_thread():
 
 def reconnect_bot():
     if global_bot_instance:
-        global_bot_instance.reconnect()
+        threading.Thread(target=global_bot_instance.reconnect, daemon=True).start()
+
 
 
 def open_config_folder():
