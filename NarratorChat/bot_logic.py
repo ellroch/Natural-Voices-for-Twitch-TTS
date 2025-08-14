@@ -9,11 +9,22 @@ import socket
 import hashlib
 import win32com.client as wincl
 import re
+import unicodedata
 from datetime import datetime
 from .config import log_service_message, load_config, load_assigned_voices
 
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6667
+
+def normalize_username(name: str) -> str:
+    """Normalize Twitch username for consistent comparison"""
+    if not isinstance(name, str):
+        return ""
+    # Compose/decompose Unicode to a standard form
+    name = unicodedata.normalize("NFKC", name)
+    # Case-insensitive match
+    return name.casefold()
+
 
 def apply_substitutions(text: str) -> str:
     for rule in load_config().get("substitutions", []):
@@ -116,8 +127,6 @@ class TwitchBot:
         self.tts_enabled = self.config.get("tts_enabled", True)
         self.socket: socket.socket | None = None
         self.connected = False
-        # load manual assignments (read-only afterwards)
-        self.assigned_voices = load_assigned_voices()
         # load preferred list for chat assignments
         self.preferred_voices, _ = get_voice_lists()
         self.voice_index_shift = self.config.get("voice_index", 0)
@@ -145,6 +154,30 @@ class TwitchBot:
             log_service_message(f"Connected to {irc['channel']}")
         except Exception as e:
             log_service_message(f"Connection/Auth failed: {e}")
+
+    def reconnect(self):
+        log_service_message("TwitchBot reconnect requested")
+        try:
+            # Stop listening thread if it's still running
+            if self.listen_thread and self.listen_thread.is_alive():
+                try:
+                    self.shutdown_event.set()
+                    if self.socket:
+                        self.socket.close()
+                except Exception as e:
+                    log_service_message(f"Error closing socket during reconnect: {e}")
+
+            # Reset state
+            self.connected = False
+            self.listen_thread = None
+            self.shutdown_event.clear()  # Allow new loop to run
+            self.user_voice_map.clear()  # Optional: reset voices
+
+            # Start fresh connection
+            self.start()
+        except Exception as e:
+            log_service_message(f"Reconnect failed: {e}")
+
 
     def _start_listening(self):
         self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
@@ -177,13 +210,23 @@ class TwitchBot:
                         continue
 
                     # choose voice: manual assignment first
-                    if username in self.assigned_voices:
-                        idx = self.assigned_voices[username]
+                    assigned_voices = load_assigned_voices()
+                    chat_user_norm = normalize_username(username)
+
+                    # Match ignoring case/Unicode differences
+                    idx = None
+                    for key, val in assigned_voices.items():
+                        if normalize_username(key) == chat_user_norm:
+                            idx = val
+                            break
+
+                    if idx is not None:
                         if idx < 0:
-                            log_service_message(f"Skipping negative index for @{username}(filterd)")
+                            log_service_message(f"Skipping negative index for @{username}(filtered)")
                             continue
                     else:
                         idx = (stable_hash(username) + self.voice_index_shift) % len(self.preferred_voices)
+
 
                     voice = self.preferred_voices[idx]
                     log_service_message(f"TTS assign @{username} -> idx={idx}")
